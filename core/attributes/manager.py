@@ -1,0 +1,745 @@
+# core/attributes/manager.py
+import os
+import time
+import asyncio
+import cv2
+import config
+import numpy as np
+import logging
+
+from core.attributes.face_processor import FaceProcessor
+from core.attributes.models_handler import AttributesModelsHandler
+from utils.background_remover import BackgroundRemover
+
+logger = logging.getLogger(__name__)
+
+DEBUG_ALIGN_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'debug_aligned')
+os.makedirs(DEBUG_ALIGN_DIR, exist_ok=True)
+
+DEBUG_REID_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'debug_reid')
+os.makedirs(DEBUG_REID_DIR, exist_ok=True)
+
+def check_body_image_quality(body_crop, min_blur=50, min_brightness=40, min_area=15000):
+    """
+    Kiểm tra chất lượng ảnh body crop cho ReID
+    
+    Args:
+        body_crop: Ảnh body đã crop (BGR)
+        min_blur: Laplacian variance tối thiểu
+        min_brightness: Độ sáng trung bình tối thiểu
+        min_area: Diện tích tối thiểu (pixels)
+    
+    Returns:
+        (is_good, quality_score, reason)
+    """
+    try:
+        if body_crop is None or body_crop.size == 0:
+            return False, 0.0, "Empty image"
+        
+        h, w = body_crop.shape[:2]
+        area = h * w
+        
+        # 1. Check minimum area
+        if area < min_area:
+            return False, 0.0, f"Too small ({area} < {min_area})"
+        
+        # 2. Convert to grayscale
+        if len(body_crop.shape) == 3:
+            gray = cv2.cvtColor(body_crop, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = body_crop
+        
+        # 3. Check blur (Laplacian variance)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if blur_score < min_blur:
+            return False, 0.0, f"Too blurry ({blur_score:.1f} < {min_blur})"
+        
+        # 4. Check brightness
+        mean_brightness = np.mean(gray)
+        if mean_brightness < min_brightness:
+            return False, 0.0, f"Too dark ({mean_brightness:.1f} < {min_brightness})"
+        
+        # 5. Check contrast
+        std_brightness = np.std(gray)
+        if std_brightness < 15:
+            return False, 0.0, f"Low contrast ({std_brightness:.1f})"
+        
+        # 6. Check if too bright (overexposed)
+        if mean_brightness > 240:
+            return False, 0.0, f"Overexposed ({mean_brightness:.1f})"
+        
+        # 7. Calculate quality score (0-1)
+        blur_norm = min(blur_score / 150.0, 1.0)
+        brightness_norm = min(mean_brightness / 180.0, 1.0)
+        contrast_norm = min(std_brightness / 60.0, 1.0)
+        
+        quality_score = (blur_norm * 0.5 + brightness_norm * 0.3 + contrast_norm * 0.2)
+        
+        return True, quality_score, "Good quality"
+        
+    except Exception as e:
+        return False, 0.0, f"Error: {str(e)}"
+
+class AttributesManager:
+    def __init__(self, reid_face_analyzer=None, db_manager=None):
+        self.reid_face_analyzer = reid_face_analyzer
+        self.models_handler = AttributesModelsHandler()
+        self.face_processor = FaceProcessor()
+        self.db_manager = db_manager
+        self.bg_remover = BackgroundRemover()
+        self.last_analysis_frame = {}
+        self.last_clothing_analysis_frame = {}
+        # 🔥 RAM CHỈ LƯU CLOTHING & EMOTION (Tạm thời, thay đổi liên tục)
+        self.temp_cache = {}  # {person_id: {'clothing': ..., 'emotion': ...}}
+        
+        # 🔥 TRACKING FRAME COUNTER cho mỗi person để tránh spam
+        self.last_analysis_frame = {}  # {person_id: frame_number}
+
+        if self.reid_face_analyzer is None:
+            print("❌ [LỖI NGHIÊM TRỌNG] AttributesManager khởi tạo với reid_face_analyzer=None!")
+        else:
+            print(f"✅ [OK] AttributesManager đã nhận Model Face: {type(self.reid_face_analyzer)}")
+
+    async def load_models(self):
+        await self.models_handler.load_models()
+        self.face_processor.detector = self.models_handler.face_detector
+
+    def create_checkerboard_bg(self, h, w, square_size=10):
+        """
+        Tạo nền caro trắng xám để ghép ảnh debug
+        """
+        bg = np.zeros((h, w, 3), dtype=np.uint8)
+        color1 = (240, 240, 240)  # Màu sáng (trắng nhạt)
+        color2 = (180, 180, 180)  # Màu tối (xám)
+
+        for y in range(0, h, square_size):
+            for x in range(0, w, square_size):
+                # Kiểm tra ô chẵn lẻ để đổi màu
+                if ((x // square_size) + (y // square_size)) % 2 == 0:
+                    cv2.rectangle(bg, (x, y), (x + square_size, y + square_size), color1, -1)
+                else:
+                    cv2.rectangle(bg, (x, y), (x + square_size, y + square_size), color2, -1)
+        
+        return bg
+    async def analyze_person_by_bbox(self, frame_resized, frame_original, bbox_resized, bbox_original, person_id, confirmed_status='pending'):
+        """
+        🔥 2-STAGE PROCESSING - DUAL FRAMES:
+        - frame_resized (640x480): Dùng cho ReID, Age, Gender, Clothing (tiết kiệm tài nguyên)
+        - frame_original (2K): Dùng cho Face extraction (chất lượng cao)
+        
+        STAGE 1 (pending/identified): Chỉ chạy age, gender, race
+        STAGE 2 (confirmed): Chỉ chạy clothes, emotion (lấy age/gender/race từ DB)
+        
+        Args:
+            frame_resized: Frame 640x480 cho AI analysis
+            frame_original: Frame 2K gốc cho face extraction
+            bbox_resized: Bbox trên frame 640x480
+            bbox_original: Bbox trên frame 2K
+            person_id: ID của người
+            confirmed_status: Status của track ('pending', 'identified', 'confirmed')
+        """
+        if not self.models_handler.models_loaded: 
+            logger.error("❌ Models chưa được load!")
+            return None
+
+        loop = asyncio.get_event_loop()
+
+        # ============================================================
+        # BƯỚC 1: KIỂM TRA TRẠNG THÁI
+        # ============================================================
+        def is_valid(val):
+            return val and str(val).lower() not in ['unknown', 'n/a', 'chưa xác định', 'none', '']
+
+        db_meta = None
+        if self.db_manager and not person_id.startswith("Temp_"):
+            db_meta = self.db_manager.get_metadata(person_id)
+
+        # 🔥 ĐIỀU KIỆN 1: Metadata đã ổn định chưa?
+        is_metadata_stable = (
+            db_meta is not None and
+            db_meta.get('status') == 'confirmed' and 
+            is_valid(db_meta.get('age')) and 
+            is_valid(db_meta.get('gender')) and 
+            is_valid(db_meta.get('race'))
+        )
+
+        # 🔥 ĐIỀU KIỆN 2: Đã đủ face vectors chưa?
+        face_vector_count = 0
+        if self.db_manager and not person_id.startswith("Temp_"):
+            face_vector_count = self.db_manager.count_vectors_for_id(config.FACE_NAMESPACE, person_id)
+
+        has_enough_vectors = (face_vector_count >= config.MAX_FACE_VECTORS_PER_PROFILE)
+
+        # 🔥 KẾT LUẬN: Hoàn toàn dừng AI khi CẢ 2 điều kiện đạt
+        is_fully_locked = is_metadata_stable and has_enough_vectors  # ← THÊM DÒNG NÀY
+
+        print(f"🔍 [ANALYZE] {person_id} | metadata_stable={is_metadata_stable} | vectors={face_vector_count}/{config.MAX_FACE_VECTORS_PER_PROFILE} | fully_locked={is_fully_locked}")
+
+
+        # 🔥 KẾT LUẬN: Hoàn toàn dừng AI khi CẢ 2 điều kiện đạt
+        # if is_fully_locked:
+        #     logger.warning(
+        #         f"⏭️ [SKIP ANALYSIS] {person_id} đã FULLY LOCKED\n"
+        #         f"   → Metadata: STABLE ✅\n"
+        #         f"   → Vectors: {face_vector_count}/{config.MAX_FACE_VECTORS_PER_PROFILE} ✅\n"
+        #         f"   → Kết luận: DỪNG AI PROCESSING"
+        #     )
+            
+        #     # 🔥 RETURN NGAY - KHÔNG CHẠY AI NỮA
+        #     return {
+        #         'id': person_id,
+        #         'status': 'fully_locked',
+        #         'face_vector': None,
+        #         'reid_vector': None,
+        #         'face_conf': 0.0,
+        #         'yaw_ratio': 99.0,
+        #         'timestamp': time.time(),
+        #         'gender_analysis': None,
+        #         'age_race_analysis': None,
+        #         'clothing_analysis': None,
+        #         'emotion_analysis': None,
+        #         'beauty_score': 0
+        #     }
+
+        # print(f"🔍 [ANALYZE] {person_id} | metadata_stable={is_metadata_stable} | vectors={face_vector_count}/{config.MAX_FACE_VECTORS_PER_PROFILE} | fully_locked={is_fully_locked}")
+
+
+        # ============================================================
+        # BƯỚC 2: QUYẾT ĐỊNH CHẠY AI GÌ - HYBRID MODE (3 STAGES)
+        # ============================================================
+        should_extract_face_vector = not has_enough_vectors
+        
+        # HYBRID MODE:
+        # - Pending: Aggressive (chạy mọi frame để lấy gender nhanh)
+        # - Identified: Moderate (chỉ chạy khi DB chưa có metadata hợp lệ)
+        # - Confirmed: Stop (đã lock, không chạy AI nữa)
+        
+        if confirmed_status == 'pending':
+            # STAGE 1: PENDING - Aggressive mode
+            should_run_primary = True  # Chạy gender/age/race mọi frame
+            should_run_secondary = False
+            stage_mode = "AGGRESSIVE"
+            
+        elif confirmed_status == 'identified':
+            # STAGE 2: IDENTIFIED - Moderate mode
+            should_run_primary = not is_metadata_stable  # Chỉ chạy khi DB chưa có
+            should_run_secondary = False
+            stage_mode = "MODERATE"
+            
+        elif confirmed_status == 'confirmed':
+            # STAGE 3: CONFIRMED - Secondary mode (clothes/emotion ONLY)
+            should_run_primary = False
+            should_run_secondary = True
+            stage_mode = "SECONDARY"
+        else:
+            # Fallback cho trường hợp không xác định
+            should_run_primary = True
+            should_run_secondary = False
+            stage_mode = "FALLBACK"
+        
+        print(f"📊 [HYBRID MODE] {person_id} | Status: {confirmed_status} | Mode: {stage_mode}")
+        print(f"   → Metadata Stable: {is_metadata_stable} | Vectors: {face_vector_count}/{config.MAX_FACE_VECTORS_PER_PROFILE}")
+        print(f"   → Run Primary (Gender/Age/Race): {should_run_primary}")
+        print(f"   → Run Secondary (Clothes/Emotion): {should_run_secondary}")
+        print(f"   → Extract Face Vector: {should_extract_face_vector}")
+
+        # ============================================================
+        # BƯỚC 3: TRÍCH XUẤT POSE (LUÔN CHẠY) - Dùng frame 640x480
+        # ============================================================
+        if hasattr(self, 'profiler'): self.profiler.start('Pose_MediaPipe')
+        keypoints, kpts_z, body_mask = self.models_handler.human_detector.detect_pose_from_bbox(frame_resized, bbox_resized)
+        if hasattr(self, 'profiler'): self.profiler.stop('Pose_MediaPipe')
+
+        # 🔥 CROP PERSON từ frame 640x480 (cho ReID, Age, Gender, Clothing)
+        bx1, by1, bx2, by2 = map(int, bbox_resized)
+        person_crop_640 = self.face_processor.safe_crop(frame_resized, bx1, by1, bx2, by2, tag="Body")
+        person_crop_final = person_crop_640
+        
+        # 🔥 CROP PERSON từ frame 2K (cho Face extraction chất lượng cao)
+        bx1_2k, by1_2k, bx2_2k, by2_2k = map(int, bbox_original)
+        person_crop_2k = self.face_processor.safe_crop(frame_original, bx1_2k, by1_2k, bx2_2k, by2_2k, tag="Body_2K")
+
+        # Xóa background nếu có mask (trên person_crop_640)
+        if body_mask is not None and person_crop_640 is not None:
+            try:
+                h, w = person_crop_640.shape[:2]
+                
+                # 1. Resize mask về đúng kích thước ảnh crop
+                mask_resized = cv2.resize(body_mask, (w, h))
+                
+                # 2. Đảm bảo mask là nhị phân (0 hoặc 255)
+                _, binary_mask = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
+                
+                # 3. Tạo nền Caro
+                bg_checkerboard = self.create_checkerboard_bg(h, w, square_size=10)
+                
+                # 4. Tạo mask nghịch đảo (cho phần nền)
+                mask_inv = cv2.bitwise_not(binary_mask)
+                
+                # 5. Lấy phần người (Foreground) - Nền đen
+                img_fg = cv2.bitwise_and(person_crop_640, person_crop_640, mask=binary_mask)
+                
+                # 6. Lấy phần nền Caro (Background) - Chỗ người đứng bị đen
+                img_bg = cv2.bitwise_and(bg_checkerboard, bg_checkerboard, mask=mask_inv)
+                
+                # 7. Cộng 2 ảnh lại
+                person_crop_final = cv2.add(img_fg, img_bg)
+                
+            except Exception as e:
+                logger.error(f"❌ Lỗi xóa nền: {e}")
+                # Nếu lỗi thì fallback về ảnh gốc (có nền)
+                person_crop_final = person_crop_640
+                
+        # if person_crop_final is not None:
+        #     try:
+                # Tạo tên file: ID_Timestamp_Body.jpg
+                # timestamp_ms = int(time.time() * 1000)
+                # file_name = f"{person_id}_{timestamp_ms}_body.jpg"
+                # save_path = os.path.join(DEBUG_REID_DIR, file_name)
+                
+                # cv2.imwrite(save_path, person_crop_final)
+                # logger.info(f"💾 [DEBUG] Saved ReID crop: {save_path}")
+            # except Exception as e:
+            #     logger.error(f"❌ Lỗi lưu ảnh debug reid: {e}")
+
+        is_body_good = False
+        body_quality_score = 0.0
+        body_quality_reason = ""
+        
+        if person_crop_final is not None:
+            # Adaptive thresholds dựa trên bbox size
+            bbox_area = (bx2 - bx1) * (by2 - by1)
+            
+            if bbox_area > 80000:
+                # Người gần camera → yêu cầu cao
+                min_blur = 70
+                min_brightness = 50
+            elif bbox_area > 40000:
+                # Người trung bình → yêu cầu vừa
+                min_blur = 50
+                min_brightness = 40
+            else:
+                # Người xa → nới lỏng
+                min_blur = 35
+                min_brightness = 35
+            
+            is_body_good, body_quality_score, body_quality_reason = check_body_image_quality(
+                person_crop_final,
+                min_blur=min_blur,
+                min_brightness=min_brightness,
+                min_area=15000
+            )
+            
+            if not is_body_good:
+                logger.debug(
+                    f"⚠️ [BODY QUALITY] {person_id} REJECTED: {body_quality_reason}\n"
+                    f"   BBox area: {bbox_area:.0f}, Quality score: {body_quality_score:.2f}"
+                )
+
+        # ============================================================
+        # BƯỚC 4: TRÍCH XUẤT REID VECTOR (LUÔN CHẠY)
+        # ============================================================
+        reid_vector = None
+        if self.reid_face_analyzer and is_body_good:  # 🔥 THÊM: is_body_good
+            if hasattr(self, 'profiler'): self.profiler.start('ReID_Extraction')
+            
+            reid_vector = self.reid_face_analyzer.extract_reid_feature(person_crop_final)
+            
+            if hasattr(self, 'profiler'): self.profiler.stop('ReID_Extraction')
+            
+            if reid_vector is not None:
+                logger.debug(
+                    f"✅ [REID] {person_id} extracted | "
+                    f"Quality: {body_quality_score:.2f} | Area: {bbox_area:.0f}"
+                )
+            else:
+                logger.warning(f"❌ [REID] {person_id} extraction failed despite good quality")
+        
+        elif not is_body_good:
+            logger.debug(f"⏭️ [REID SKIP] {person_id} - {body_quality_reason}")
+
+
+        # ============================================================
+        # BƯỚC 5: FACE DETECTION - 🔥 DÙNG FRAME 2K CHO CHẤT LƯỢNG CAO
+        # ============================================================
+        face_vector, face_conf, yaw_ratio = None, 0.0, 99.0
+        face_img_224, face_img_final = None, None
+        is_face_valid = False
+        beauty_score = 0
+
+        if self.models_handler.face_detector:
+            if hasattr(self, 'profiler'): 
+                self.profiler.start('2. Face_Detection')
+                self.profiler._current_context = {
+                    'person_id': person_id,
+                    'metadata_stable': is_metadata_stable,
+                    'extract_vector': should_extract_face_vector
+                }
+            try:
+                # 🔥 DETECT FACE trên person_crop_2k (chất lượng cao hơn)
+                dets, lms = self.models_handler.face_detector.detect(
+                    person_crop_2k, 
+                    threshold=config.FACE_CONFIDENCE_THRESHOLD,
+                    profiler=getattr(self, 'profiler', None)
+                )
+                
+                if hasattr(self, 'profiler'): self.profiler.stop('2. Face_Detection')
+
+                if dets is not None and len(dets) > 0:
+                    best_idx = np.argmax(dets[:, 4])
+                    face_conf = float(dets[best_idx, 4]) 
+                    current_lms = lms[best_idx].reshape(5, 2)
+                    
+                    # 🔥 CROP FACE từ person_crop_2k (2K quality)
+                    face_img_raw, offset = self.face_processor.get_face_with_margin(
+                        person_crop_2k, dets[best_idx, :4], margin_ratio=0.15
+                    )
+
+                    
+                    if face_img_raw is not None and face_img_raw.size > 0:
+                        # Kiểm tra chất lượng ảnh
+                        if not self.face_processor.check_image_quality(face_img_raw):
+                            print(f"   ⚠️ [BLUR] Ảnh quá mờ/tối, bỏ qua frame")
+                            return {
+                                'id': person_id, 
+                                'status': 'skipped_blur', 
+                                'timestamp': time.time(),
+                                'face_vector': None, 
+                                'reid_vector': reid_vector, 
+                                'face_conf': 0.0, 
+                                'yaw_ratio': 99.0
+                            }
+
+                        # Align face
+                        lms_on_face = current_lms - np.array([offset[0], offset[1]])
+                        is_straight, yaw_ratio = self.face_processor.check_face_straight_2d(lms_on_face)
+                        
+                        face_img_112 = self.face_processor.align_face_2d(face_img_raw, lms_on_face, output_size=112)
+                        face_img_224 = self.face_processor.align_face_224(face_img_raw, lms_on_face)
+                        # ============================================================
+                        # 🔥 [NEW] SAVE DEBUG ALIGNED IMAGE
+                        # ============================================================
+                        if face_img_112 is not None and face_img_224 is not None:
+                            is_face_valid = True
+                            face_img_final = face_img_224
+                            # try:
+                            ts_now = int(time.time() * 1000)
+                            try:
+                                ts_now = int(time.time() * 1000)
+                                # Lưu ảnh để check xem còn bị khung đen không
+                                debug_path = os.path.join(DEBUG_ALIGN_DIR, f"{person_id}_{ts_now}_check_align.jpg")
+                                cv2.imwrite(debug_path, face_img_final)
+                                print(f"💾 [SAVED] {debug_path}")
+                            except Exception as e:
+                                logger.error(f"❌ Lỗi lưu ảnh: {e}" )  
+                            #     # 1. Lưu ảnh Input cho Face Vector (ReID) - quan trọng nhất
+                            #     reid_path = os.path.join(DEBUG_ALIGN_DIR, f"{person_id}_{ts_now}_input_REID.jpg")
+                            #     cv2.imwrite(reid_path, face_img_112)
+                            
+                            #   
+                                    
+                            # except Exception as e:
+                            #     logger.error(f"❌ Lỗi lưu ảnh Debug AI Input: {e}")
+
+                            # 🔥 CHỈ EXTRACT KHI CẦN (chưa đủ 25 vectors)
+                            if should_extract_face_vector and self.reid_face_analyzer:
+                                # Chấp nhận cả góc nghiêng để học đa dạng
+                                accept_yaw = yaw_ratio < 3.0  # Nới lỏng từ 2.0 → 3.0
+                                
+                                if accept_yaw and is_straight:
+                                    face_vector, _ = self.reid_face_analyzer.extract_face_feature(face_img_112)
+                                    
+                                    if face_vector is not None:
+                                        print(f"      ✅ [EXTRACT] Vector OK | Yaw: {yaw_ratio:.2f} | Conf: {face_conf:.2f}")
+                                    else:
+                                        print(f"      ❌ [EXTRACT FAIL] Vector = None")
+                                elif not accept_yaw:
+                                    print(f"      ⏭️ [SKIP] Yaw quá lớn: {yaw_ratio:.2f} > 3.0")
+                                else:
+                                    print(f"      ⏭️ [SKIP] Mặt không thẳng")
+                            elif not should_extract_face_vector:
+                                print(f"      ⏭️ [SKIP] Đã đủ {face_vector_count} vectors")
+                            
+                            # Tính beauty score
+                            beauty_score = self.face_processor.calculate_simple_golden_score(lms_on_face)
+
+            except Exception as e:
+                logger.error(f"⚠️ Lỗi xử lý Face: {e}", exc_info=True)
+
+        # ============================================================
+        # BƯỚC 6: ĐỊNH NGHĨA CÁC TASKS AI
+        # ============================================================
+        
+        async def run_gender():
+            """Chỉ chạy khi metadata CHƯA STABLE"""
+            if not should_run_primary: 
+                return None
+            if face_img_final is None:
+                print("   ❌ [run_gender] face_img_final is None")
+                return None
+            if hasattr(self, 'profiler'): self.profiler.start('3. Gender_Model')
+            try:
+                if face_img_final is not None:
+                    gender_input = cv2.resize(face_img_final, (224, 224))
+                else:
+                    return None
+                
+                res = await loop.run_in_executor(
+                    self.models_handler.executor, 
+                    self.models_handler.predict_gender, 
+                    gender_input, keypoints
+                )
+            except Exception as e:
+                logger.error(f"❌ Gender error: {e}")
+                res = None
+            
+            if hasattr(self, 'profiler'): self.profiler.stop('3. Gender_Model')
+            return res
+
+        async def run_age_race():
+            """Chỉ chạy khi metadata CHƯA STABLE và có Face hợp lệ"""
+            if not should_run_primary: 
+                return None
+            
+            if self.models_handler.age_race_estimator is None or not is_face_valid: 
+                return None
+
+            if hasattr(self, 'profiler'): self.profiler.start('5. AgeRace_ONNX')
+            try:
+                face_input = cv2.resize(face_img_final, (224, 224))
+                
+                if face_input is None: 
+                    return None
+                 #2. Lưu ảnh Input cho Age/Gender/Race
+                     
+               
+
+                res = await loop.run_in_executor(
+                    self.models_handler.executor, 
+                    self.models_handler.predict_age_race, 
+                    face_img_final
+                )
+                
+                # Đổi tên key để phân biệt
+                if res and 'age' in res:
+                    res['age_onnx'] = res.pop('age')
+                    res['age_onnx_conf'] = res.pop('age_conf')
+
+            except Exception as e:
+                logger.error(f"❌ Age/Race error: {e}")
+                res = None
+            
+            if hasattr(self, 'profiler'): self.profiler.stop('5. AgeRace_ONNX')
+            return res
+
+        async def run_clothing():
+            """LUÔN CHẠY - Cần real-time"""
+            if hasattr(self, 'profiler'): self.profiler.start('4. Cloth_Color')
+            
+            # Nếu crop lỗi thì bỏ qua
+            if person_crop_final is None:
+                print(f"   ❌ [run_clothing] person_crop_final is None")
+                return None
+
+            try:
+                res = await self.models_handler.predict_clothing_async(
+                    image=person_crop_final,  # 🔥 Dùng person_crop_final (640x480)
+                    keypoints=keypoints, 
+                    kpts_z=kpts_z,
+                    external_data={'person_id': person_id}
+                )
+                if res:
+                    print(f"   ✅ [run_clothing] OK: upper={res.get('upper_type')}, lower={res.get('lower_type')}")
+            except Exception as e:
+                # logger.error(f"❌ Clothing error: {e}")
+                res = None
+            
+            if hasattr(self, 'profiler'): self.profiler.stop('4. Cloth_Color')
+            return res
+
+        async def run_emotion():
+            """LUÔN CHẠY nếu có face hợp lệ"""
+            if getattr(self.models_handler, 'emotion_estimator', None) is None or not is_face_valid:
+                return None
+            
+            if hasattr(self, 'profiler'): self.profiler.start('6. Emotion_Model')
+            try:
+                face_gray = cv2.cvtColor(face_img_final, cv2.COLOR_BGR2GRAY)
+                face_gray = cv2.resize(face_gray, (48, 48)) 
+                res = await loop.run_in_executor(
+                    self.models_handler.executor, 
+                    self.models_handler.predict_emotion, 
+                    face_gray
+                )
+            except Exception as e:
+                logger.error(f"❌ Emotion error: {e}")
+                res = None
+            
+            if hasattr(self, 'profiler'): self.profiler.stop('6. Emotion_Model')
+            return res
+
+        # ============================================================
+        # BƯỚC 7: GATHER TASKS - 2 GIAI ĐOẠN
+        # ============================================================
+        tasks = []
+        task_names = []
+        
+        if should_run_primary:
+            # GIAI ĐOẠN 1: Primary attributes ONLY
+            tasks.extend([run_gender(), run_age_race()])
+            task_names.extend(['gender', 'age_race'])
+            print(f"   🔵 [STAGE 1] Chạy {len(tasks)} primary tasks: {task_names}")
+            
+        elif should_run_secondary:
+            # GIAI ĐOẠN 2: Secondary attributes ONLY
+            tasks.extend([run_clothing(), run_emotion()])
+            task_names.extend(['clothing', 'emotion'])
+            print(f"   🟢 [STAGE 2] Chạy {len(tasks)} secondary tasks: {task_names}")
+            
+        else:
+            # Không chạy gì cả (đã locked hoàn toàn)
+            print(f"   ⚪ [LOCKED] Không chạy AI (metadata stable + vectors đủ)")
+        
+        try:
+            # 🔥 BỎ TIMEOUT WRAPPER - Để tasks chạy đến khi hoàn thành
+            results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            new_results = {}
+            for i, res in enumerate(results_raw):
+                task_name = task_names[i]
+                
+                # Kiểm tra xem kết quả có phải là lỗi không
+                if isinstance(res, Exception):
+                    logger.error(f"⚠️ [TASK ERROR] Task '{task_name}' failed: {res}")
+                    new_results[task_name] = None # Gán None nếu lỗi để code phía sau không crash
+                else:
+                    new_results[task_name] = res
+
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ [AI TIMEOUT] {person_id} processing took > 2s")
+            # Return minimal result
+            return {
+                'id': person_id,
+                'status': 'timeout',
+                'face_vector': None,
+                'reid_vector': reid_vector,
+                'face_conf': 0.0,
+                'yaw_ratio': 99.0,
+                'timestamp': time.time()
+            }
+
+        # ============================================================
+        # BƯỚC 8: TẠO KẾT QUẢ CUỐI CÙNG
+        # ============================================================
+        
+        # --- Gender ---
+        if is_metadata_stable and db_meta:
+            # Đã stable → lấy từ DB
+            final_gender = {
+                'gender': db_meta.get('gender'),
+                'confidence': 1.0,
+                'source': 'database'
+            }
+        elif confirmed_status == 'confirmed' and db_meta:
+            # GIAI ĐOẠN 2: Confirmed → lấy từ DB
+            final_gender = {
+                'gender': db_meta.get('gender'),
+                'confidence': 1.0,
+                'source': 'database_confirmed'
+            }
+        else:
+            # GIAI ĐOẠN 1: Lấy từ AI
+            final_gender = new_results.get('gender')
+            if final_gender:
+                final_gender['source'] = 'live'
+            elif should_run_primary:
+                print(f"   ⚠️ [WARNING] Gender task returned None! Check run_gender logs.")
+         
+        # --- Age/Race ---
+        if is_metadata_stable and db_meta:
+            # Đã stable → lấy từ DB
+            final_race = {
+                'race': db_meta.get('race'),
+                'race_conf': 1.0,
+                'age_onnx': db_meta.get('age_onnx', 'unknown'),
+                'age_onnx_conf': 1.0,
+                'source': 'database'
+            }
+        elif confirmed_status == 'confirmed' and db_meta:
+            # GIAI ĐOẠN 2: Confirmed → lấy từ DB
+            final_race = {
+                'race': db_meta.get('race'),
+                'race_conf': 1.0,
+                'age_onnx': db_meta.get('age_onnx', 'unknown'),
+                'age_onnx_conf': 1.0,
+                'source': 'database_confirmed'
+            }
+        else:
+            # GIAI ĐOẠN 1: Lấy từ AI
+            age_race_from_onnx = new_results.get('age_race')
+            if age_race_from_onnx:
+                print(f"🔍 [AI-AGE/RACE] {person_id} → Age={age_race_from_onnx.get('age_onnx')}, Race={age_race_from_onnx.get('race')}")
+                final_race = {
+                    'race': age_race_from_onnx.get('race'),
+                    'race_conf': age_race_from_onnx.get('race_conf', 0.0),
+                    'age_onnx': age_race_from_onnx.get('age_onnx'),
+                    'age_onnx_conf': age_race_from_onnx.get('age_onnx_conf', 0.0),
+                    'source': 'live'
+                }
+            elif should_run_primary:
+                print(f"❌ [AI-AGE/RACE] {person_id} → NULL!")
+                final_race = None
+            else:
+                final_race = None
+        
+        # --- Clothing (GIAI ĐOẠN 2 ONLY) ---
+        final_clothing = None
+        if should_run_secondary:
+            final_clothing = new_results.get('clothing')
+            if final_clothing:
+                logger.info(f"   - Clothing received: {final_clothing}")
+                if person_id not in self.temp_cache:
+                    self.temp_cache[person_id] = {}
+                self.temp_cache[person_id]['clothing'] = final_clothing
+        
+        # --- Emotion (GIAI ĐOẠN 2 ONLY) ---
+        final_emotion = None
+        if should_run_secondary:
+            final_emotion = new_results.get('emotion')
+            if final_emotion:
+                if person_id not in self.temp_cache:
+                    self.temp_cache[person_id] = {}
+                self.temp_cache[person_id]['emotion'] = final_emotion
+
+        # --- Debug Log ---
+        print(f"📦 [RETURN] {person_id}:")
+        print(f"   - face_vector: {'YES' if face_vector else 'NO'} (should_extract={should_extract_face_vector})")
+        print(f"   - reid_vector: {'YES' if reid_vector else 'NO'}")
+        if final_gender:
+            print(f"   - Gender: {final_gender.get('gender')} (Source: {final_gender.get('source', 'live')})")
+        if final_race:
+            print(f"   - Race: {final_race.get('race')}, Age: {final_race.get('age_onnx')} (Source: {final_race.get('source', 'live')})")
+        
+        # ============================================================
+        # BƯỚC 9: TRẢ VỀ
+        # ============================================================
+        return {
+            'id': person_id,
+            'status': 'confirmed' if is_fully_locked else 'searching',
+            'face_vector': face_vector,  # 🔥 Chỉ có giá trị khi should_extract=True
+            'reid_vector': reid_vector,
+            'face_conf': face_conf,
+            'yaw_ratio': yaw_ratio,
+            'face_img': face_img_224,
+            'timestamp': time.time(),
+
+            'body_quality_score': body_quality_score,
+            'body_quality_reason': body_quality_reason,
+            
+            # Kết quả cho Consolidator
+            'gender_analysis': final_gender,
+            'age_race_analysis': final_race,
+            'clothing_analysis': final_clothing,
+            'emotion_analysis': final_emotion,
+            'beauty_score': beauty_score
+        }
