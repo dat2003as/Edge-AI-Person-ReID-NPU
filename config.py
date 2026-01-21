@@ -87,7 +87,6 @@ TRACKER_CONFIG_PATH = "botsort.yaml"
 MAX_DISAPPEARED_FRAMES_BEFORE_DELETION = 50
 ATTRIBUTE_ANALYSIS_INTERVAL = 5
 # config.pyq
-CENTERFACE_MODEL_PATH = "models/centerface.cix"
 
 # ======================================================================================
 # <<< TRACKER LOGIC CONFIGURATION - CẤU HÌNH LOGIC TRACKER >>>

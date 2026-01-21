@@ -4,8 +4,8 @@ venv
 faiss_indexes
 faiss_indexes_cccd
 models
-cam_server.py
 draw_bk.py
 main_dual_stream_bk_SLOW.py
 main_dual_stream_bk.py
 tracked_object.py
+test_http_stream.py
